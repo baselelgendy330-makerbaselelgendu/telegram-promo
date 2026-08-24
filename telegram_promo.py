@@ -109,8 +109,31 @@ async def get_latest_saved_message():
 
 
 async def send_to_chat(chat, promo_message):
+    text = promo_message.message or ""
+    entities = promo_message.entities or None
+
+    if promo_message.media:
+        await telegram_call(
+            lambda: client.send_file(
+                chat,
+                promo_message.media,
+                caption=text,
+                formatting_entities=entities,
+            )
+        )
+        return
+
+    if not text.strip():
+        raise RuntimeError(
+            "Latest Saved Messages item has no text or media to send."
+        )
+
     await telegram_call(
-        lambda: client.send_message(chat, promo_message)
+        lambda: client.send_message(
+            chat,
+            text,
+            formatting_entities=entities,
+        )
     )
 
 
