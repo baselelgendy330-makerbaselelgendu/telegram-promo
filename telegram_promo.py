@@ -36,11 +36,21 @@ SPECIAL_TARGET = normalize_chat(
 SPECIAL_SOURCE = normalize_chat(
     os.getenv("TG_SPECIAL_SOURCE", "Special_Promoaix")
 )
+SECOND_SPECIAL_TARGET = normalize_chat(
+    os.getenv("TG_SECOND_SPECIAL_TARGET", "gpt_nocard")
+)
+SECOND_SPECIAL_SOURCE = normalize_chat(
+    os.getenv("TG_SECOND_SPECIAL_SOURCE", "pwivm")
+)
 
 GENERAL_TARGET_CHATS = [
     chat
     for chat in TARGET_CHATS
-    if chat.casefold() != SPECIAL_TARGET.casefold()
+    if chat.casefold()
+    not in {
+        SPECIAL_TARGET.casefold(),
+        SECOND_SPECIAL_TARGET.casefold(),
+    }
 ]
 
 GENERAL_INTERVAL_SECONDS = int(
@@ -48,6 +58,9 @@ GENERAL_INTERVAL_SECONDS = int(
 )
 SPECIAL_INTERVAL_SECONDS = int(
     os.getenv("SPECIAL_PROMO_INTERVAL_SECONDS", "1800")
+)
+SECOND_SPECIAL_INTERVAL_SECONDS = int(
+    os.getenv("SECOND_SPECIAL_PROMO_INTERVAL_SECONDS", "1500")
 )
 
 logging.basicConfig(
@@ -144,6 +157,20 @@ async def get_latest_special_message():
     return messages[0]
 
 
+async def get_latest_second_special_message():
+    messages = await telegram_call(
+        lambda: client.get_messages(SECOND_SPECIAL_SOURCE, limit=1)
+    )
+
+    if not messages:
+        raise RuntimeError(
+            f"@{SECOND_SPECIAL_SOURCE} has no messages. Send the special "
+            "promotional message there first."
+        )
+
+    return messages[0]
+
+
 async def send_to_chat(chat, promo_message):
     text = promo_message.message or ""
     entities = promo_message.entities or None
@@ -227,6 +254,15 @@ async def send_special_round():
     )
 
 
+async def send_second_special_round():
+    promo_message = await get_latest_second_special_message()
+    await send_safely(
+        SECOND_SPECIAL_TARGET,
+        promo_message,
+        f"@{SECOND_SPECIAL_SOURCE}",
+    )
+
+
 async def run_general_promos():
     while True:
         try:
@@ -255,6 +291,20 @@ async def run_special_promo():
         await asyncio.sleep(SPECIAL_INTERVAL_SECONDS)
 
 
+async def run_second_special_promo():
+    while True:
+        try:
+            await send_second_special_round()
+        except Exception:
+            logging.exception("Second special broadcast round failed.")
+
+        logging.info(
+            "Next second special round in %s minutes.",
+            SECOND_SPECIAL_INTERVAL_SECONDS / 60,
+        )
+        await asyncio.sleep(SECOND_SPECIAL_INTERVAL_SECONDS)
+
+
 async def main():
     await reconnect()
 
@@ -271,10 +321,17 @@ async def main():
         SPECIAL_SOURCE,
         SPECIAL_INTERVAL_SECONDS / 60,
     )
+    logging.info(
+        "Second special promo: @%s receives @%s every %s minutes.",
+        SECOND_SPECIAL_TARGET,
+        SECOND_SPECIAL_SOURCE,
+        SECOND_SPECIAL_INTERVAL_SECONDS / 60,
+    )
 
     await asyncio.gather(
         run_general_promos(),
         run_special_promo(),
+        run_second_special_promo(),
     )
 
 
