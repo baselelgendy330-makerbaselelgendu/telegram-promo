@@ -30,11 +30,9 @@ TARGET_CHATS = [
     if item.strip()
 ]
 
-SPECIAL_TARGET = normalize_chat(
+# Keep the cancelled Elite target excluded from general broadcasts.
+DISABLED_SPECIAL_TARGET = normalize_chat(
     os.getenv("TG_SPECIAL_TARGET", "elitemethodchat")
-)
-SPECIAL_SOURCE = normalize_chat(
-    os.getenv("TG_SPECIAL_SOURCE", "Special_Promoaix")
 )
 SECOND_SPECIAL_TARGET = normalize_chat(
     os.getenv("TG_SECOND_SPECIAL_TARGET", "gpt_nocard")
@@ -48,7 +46,7 @@ GENERAL_TARGET_CHATS = [
     for chat in TARGET_CHATS
     if chat.casefold()
     not in {
-        SPECIAL_TARGET.casefold(),
+        DISABLED_SPECIAL_TARGET.casefold(),
         SECOND_SPECIAL_TARGET.casefold(),
     }
 ]
@@ -56,12 +54,7 @@ GENERAL_TARGET_CHATS = [
 GENERAL_INTERVAL_SECONDS = int(
     os.getenv("GENERAL_PROMO_INTERVAL_SECONDS", "3600")
 )
-SPECIAL_INTERVAL_SECONDS = int(
-    os.getenv("SPECIAL_PROMO_INTERVAL_SECONDS", "900")
-)
-SECOND_SPECIAL_INTERVAL_SECONDS = int(
-    os.getenv("SECOND_SPECIAL_PROMO_INTERVAL_SECONDS", "900")
-)
+SECOND_SPECIAL_INTERVAL_SECONDS = 40 * 60
 
 logging.basicConfig(
     level=logging.INFO,
@@ -138,20 +131,6 @@ async def get_latest_saved_message():
         raise RuntimeError(
             "Saved Messages is empty. Send your promotional message "
             "to Saved Messages first."
-        )
-
-    return messages[0]
-
-
-async def get_latest_special_message():
-    messages = await telegram_call(
-        lambda: client.get_messages(SPECIAL_SOURCE, limit=1)
-    )
-
-    if not messages:
-        raise RuntimeError(
-            f"@{SPECIAL_SOURCE} has no messages. Send the special "
-            "promotional message there first."
         )
 
     return messages[0]
@@ -245,15 +224,6 @@ async def send_general_round():
         await asyncio.sleep(5)
 
 
-async def send_special_round():
-    promo_message = await get_latest_special_message()
-    await send_safely(
-        SPECIAL_TARGET,
-        promo_message,
-        f"@{SPECIAL_SOURCE}",
-    )
-
-
 async def send_second_special_round():
     promo_message = await get_latest_second_special_message()
     await send_safely(
@@ -275,20 +245,6 @@ async def run_general_promos():
             GENERAL_INTERVAL_SECONDS / 60,
         )
         await asyncio.sleep(GENERAL_INTERVAL_SECONDS)
-
-
-async def run_special_promo():
-    while True:
-        try:
-            await send_special_round()
-        except Exception:
-            logging.exception("Special broadcast round failed.")
-
-        logging.info(
-            "Next special round in %s minutes.",
-            SPECIAL_INTERVAL_SECONDS / 60,
-        )
-        await asyncio.sleep(SPECIAL_INTERVAL_SECONDS)
 
 
 async def run_second_special_promo():
@@ -316,12 +272,6 @@ async def main():
         GENERAL_INTERVAL_SECONDS / 60,
     )
     logging.info(
-        "Special promo: @%s receives @%s every %s minutes.",
-        SPECIAL_TARGET,
-        SPECIAL_SOURCE,
-        SPECIAL_INTERVAL_SECONDS / 60,
-    )
-    logging.info(
         "Second special promo: @%s receives @%s every %s minutes.",
         SECOND_SPECIAL_TARGET,
         SECOND_SPECIAL_SOURCE,
@@ -330,7 +280,6 @@ async def main():
 
     await asyncio.gather(
         run_general_promos(),
-        run_special_promo(),
         run_second_special_promo(),
     )
 
