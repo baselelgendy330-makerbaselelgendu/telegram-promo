@@ -2,8 +2,10 @@ import asyncio
 import logging
 import os
 import re
+import sqlite3
+from pathlib import Path
 
-from telethon import TelegramClient, errors
+from telethon import TelegramClient, errors, functions, types
 from telethon.sessions import StringSession
 
 
@@ -84,7 +86,7 @@ client = TelegramClient(
     connection_retries=20,
     request_retries=10,
     retry_delay=5,
-    flood_sleep_threshold=60,
+    flood_sleep_threshold=0,
     receive_updates=False,
 )
 
@@ -181,8 +183,38 @@ async def get_latest_second_special_message():
     return messages[0]
 
 
+class NotInGroup(Exception):
+    pass
+
+
+async def member_target(chat):
+    if chat.startswith("https://t.me/+"):
+        invite = await client(functions.messages.CheckChatInviteRequest(
+            hash=chat.removeprefix("https://t.me/+")
+        ))
+        if not isinstance(invite, types.ChatInviteAlready):
+            raise NotInGroup()
+        entity = invite.chat
+    else:
+        numeric = re.fullmatch(r"-[0-9]+", chat)
+        target = int(chat) if numeric else chat
+        try:
+            entity = await client.get_entity(target)
+        except (ValueError, errors.ChannelPrivateError):
+            if not numeric:
+                raise
+            # Only decide absence after a successful scan, including archived chats.
+            async for dialog in client.iter_dialogs():
+                if dialog.id == target:
+                    return dialog.input_entity
+            raise NotInGroup()
+    if getattr(entity, "left", False) or getattr(entity, "kicked", False):
+        raise NotInGroup()
+    return entity
+
+
 async def send_to_chat(chat, promo_message):
-    chat = await telegram_call(lambda: resolve_chat(chat))
+    chat = await telegram_call(lambda: member_target(chat))
     text = promo_message.message or ""
     entities = promo_message.entities or None
 
@@ -211,41 +243,43 @@ async def send_to_chat(chat, promo_message):
     )
 
 
+SEND_GAP = max(1, int(os.getenv("TG_SEND_GAP_SECONDS", "30")))
+send_lock = asyncio.Lock()
+next_send = 0.0
+slow_until = {}
+
+
 async def send_safely(chat, promo_message, source):
-    try:
-        await send_to_chat(chat, promo_message)
-        logging.info(
-            "Sent successfully to @%s from %s.",
-            chat,
-            source,
-        )
-
-    except errors.SlowModeWaitError as error:
-        logging.warning(
-            "@%s has slow mode. Waiting %s seconds.",
-            chat,
-            error.seconds,
-        )
-        await asyncio.sleep(error.seconds + 2)
-
-    except errors.FloodWaitError as error:
-        logging.warning(
-            "Telegram requested a %s-second wait.",
-            error.seconds,
-        )
-        await asyncio.sleep(error.seconds + 2)
-
-    except (
-        errors.ChatWriteForbiddenError,
-        errors.UserBannedInChannelError,
-    ):
-        logging.error(
-            "Your account cannot send messages to @%s.",
-            chat,
-        )
-
-    except Exception:
-        logging.exception("Failed to send to @%s", chat)
+    global next_send
+    key = chat_key(chat)
+    loop = asyncio.get_running_loop()
+    async with send_lock:
+        if key in blocked or slow_until.get(key, 0) > loop.time():
+            return
+        delay = next_send - loop.time()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        wait = SEND_GAP
+        try:
+            await send_to_chat(chat, promo_message)
+            logging.info("Sent to %s from %s.", chat, source)
+        except (NotInGroup, errors.UserNotParticipantError):
+            with database:
+                database.execute("INSERT OR IGNORE INTO blacklist VALUES (?, ?)", (account, key))
+            blocked.add(key)
+            logging.warning("Not a member of %s. Added to blacklist.", chat)
+        except errors.SlowModeWaitError as error:
+            slow_until[key] = loop.time() + error.seconds + 2
+            logging.info("Skipping %s for slow mode (%s seconds).", chat, error.seconds)
+        except errors.FloodWaitError as error:
+            wait = max(wait, error.seconds + 2)
+            logging.warning("Telegram requires a shared sending pause of %s seconds.", wait)
+        except (errors.ChatWriteForbiddenError, errors.UserBannedInChannelError):
+            logging.warning("Skipping %s because writing is restricted.", chat)
+        except Exception:
+            logging.exception("Skipping unavailable target %s.", chat)
+        finally:
+            next_send = loop.time() + wait
 
 
 async def send_general_round():
@@ -253,10 +287,11 @@ async def send_general_round():
 
     for chat in GENERAL_TARGET_CHATS:
         await send_safely(chat, promo_message, "Saved Messages")
-        await asyncio.sleep(5)
 
 
 async def send_second_special_round():
+    if chat_key(SECOND_SPECIAL_TARGET) in blocked:
+        return
     promo_message = await get_latest_second_special_message()
     await send_safely(
         SECOND_SPECIAL_TARGET,
@@ -294,10 +329,16 @@ async def run_second_special_promo():
 
 
 async def main():
+    global database, blocked, account
     await reconnect()
 
     me = await telegram_call(client.get_me)
-    logging.info("Logged in as %s", me.first_name)
+    account = me.id
+    data_dir = Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or ".")
+    database = sqlite3.connect(data_dir / "promo_blacklist.sqlite3")
+    database.execute("CREATE TABLE IF NOT EXISTS blacklist (account INTEGER, target TEXT, PRIMARY KEY(account, target))")
+    blocked = {row[0] for row in database.execute("SELECT target FROM blacklist WHERE account=?", (account,))}
+    logging.info("Logged in as %s, %d blacklisted targets.", me.first_name, len(blocked))
     logging.info(
         "General promo: %s chats every %s minutes.",
         len(GENERAL_TARGET_CHATS),
