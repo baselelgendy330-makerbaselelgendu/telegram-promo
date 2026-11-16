@@ -1,13 +1,28 @@
 import asyncio
 import logging
 import os
+import re
 
 from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
 
 
 def normalize_chat(value: str) -> str:
-    return value.strip().replace("https://t.me/", "").lstrip("@")
+    value = value.strip()
+    path = re.sub(r"^(?:https?://)?(?:t\.me|telegram\.me)/", "", value, flags=re.I).rstrip("/")
+    private_post = re.fullmatch(r"c/([0-9]+)/[0-9]+", path)
+    if private_post:
+        return str(-1000000000000 - int(private_post.group(1)))
+    if path.startswith("joinchat/"):
+        path = "+" + path[len("joinchat/"):]
+    if path.startswith("+"):
+        return "https://t.me/" + path
+    return path.lstrip("@")
+
+
+def chat_key(chat):
+    return chat if chat.startswith("https://t.me/+") else chat.casefold()
+
 
 
 def required_env(name: str) -> str:
@@ -44,10 +59,10 @@ SECOND_SPECIAL_SOURCE = normalize_chat(
 GENERAL_TARGET_CHATS = [
     chat
     for chat in TARGET_CHATS
-    if chat.casefold()
+    if chat_key(chat)
     not in {
-        DISABLED_SPECIAL_TARGET.casefold(),
-        SECOND_SPECIAL_TARGET.casefold(),
+        chat_key(DISABLED_SPECIAL_TARGET),
+        chat_key(SECOND_SPECIAL_TARGET),
     }
 ]
 
@@ -136,9 +151,25 @@ async def get_latest_saved_message():
     return messages[0]
 
 
+async def resolve_chat(chat):
+    if not re.fullmatch(r"-[0-9]+", chat):
+        return chat
+
+    chat_id = int(chat)
+    try:
+        return await client.get_input_entity(chat_id)
+    except ValueError:
+        # A fresh StringSession may not have encountered the private group yet.
+        async for dialog in client.iter_dialogs():
+            if dialog.id == chat_id:
+                return dialog.input_entity
+        raise ValueError(f"Chat {chat_id} was not found in the sending account's dialogs.")
+
+
 async def get_latest_second_special_message():
+    source = await telegram_call(lambda: resolve_chat(SECOND_SPECIAL_SOURCE))
     messages = await telegram_call(
-        lambda: client.get_messages(SECOND_SPECIAL_SOURCE, limit=1)
+        lambda: client.get_messages(source, limit=1)
     )
 
     if not messages:
@@ -151,6 +182,7 @@ async def get_latest_second_special_message():
 
 
 async def send_to_chat(chat, promo_message):
+    chat = await telegram_call(lambda: resolve_chat(chat))
     text = promo_message.message or ""
     entities = promo_message.entities or None
 
