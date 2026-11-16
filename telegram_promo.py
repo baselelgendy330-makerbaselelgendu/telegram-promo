@@ -3,6 +3,9 @@ import logging
 import os
 import re
 import sqlite3
+import time
+from control import State, Panel
+from telethon import utils
 from pathlib import Path
 
 from telethon import TelegramClient, errors, functions, types
@@ -19,7 +22,8 @@ def normalize_chat(value: str) -> str:
         path = "+" + path[len("joinchat/"):]
     if path.startswith("+"):
         return "https://t.me/" + path
-    return path.lstrip("@")
+    public_post = re.fullmatch(r"([A-Za-z][A-Za-z0-9_]+)/[0-9]+", path)
+    return public_post.group(1) if public_post else path.lstrip("@")
 
 
 def chat_key(chat):
@@ -247,118 +251,187 @@ SEND_GAP = max(1, int(os.getenv("TG_SEND_GAP_SECONDS", "30")))
 send_lock = asyncio.Lock()
 next_send = 0.0
 slow_until = {}
+panel = None
+
+async def validate_groups(inputs):
+    existing = {k for _,k,_ in state.groups()}
+    excluded = {chat_key(SECOND_SPECIAL_TARGET), chat_key(DISABLED_SPECIAL_TARGET)}
+    known = existing | excluded | blocked
+    # Resolve existing aliases against dialogs so a username and numeric ID
+    # cannot create two deliveries to the same group.
+    try:
+        async for dialog in client.iter_dialogs():
+            aliases = {str(dialog.id)}
+            if getattr(dialog.entity,"username",None):
+                aliases.add(dialog.entity.username.casefold())
+            if aliases & known:
+                known.update(aliases)
+    except Exception:
+        return [], ["تعذّر التحقق من قائمة المحادثات. حاول مجددًا."]
+    found,notes = [],[]
+    for raw in inputs:
+        k = chat_key(normalize_chat(raw))
+        if k in known:
+            notes.append(f"مسجّلة أو مستبعدة بالفعل · {raw[:80]}")
+            continue
+        try:
+            entity = await member_target(k)
+            if not isinstance(entity,(types.Chat,types.Channel)):
+                entity = await client.get_entity(entity)
+            if not isinstance(entity,(types.Chat,types.Channel)) or getattr(entity,"broadcast",False):
+                raise ValueError()
+            ident = str(utils.get_peer_id(entity))
+            aliases = {ident,k}
+            if getattr(entity,"username",None):
+                aliases.add(entity.username.casefold())
+            # Imported invite hashes do not appear in the dialogs listing.
+            for invite in known.copy():
+                if invite.startswith("https://t.me/+") and ident not in known:
+                    try:
+                        known.add(str(utils.get_peer_id(await member_target(invite))))
+                    except (NotInGroup,errors.InviteHashExpiredError,errors.InviteHashInvalidError):
+                        pass
+            if aliases & known:
+                notes.append(f"مسجّلة أو مستبعدة بالفعل · {entity.title}")
+            else:
+                found.append((ident,entity.title))
+                known.update(aliases)
+                notes.append(f"• {entity.title} ({ident})")
+        except errors.FloodWaitError as exc:
+            with database:
+                state.set("flood", max(state.get("flood",0),time.time()+exc.seconds+2))
+            notes.append("طلب تيليجرام الانتظار. أعد إرسال بقية الأسماء لاحقًا.")
+            break
+        except Exception:
+            notes.append(f"تعذّر التحقق من المجموعة أو الوصول إليها · {raw[:80]}")
+    return found,notes
 
 
-async def send_safely(chat, promo_message, source):
+async def send_safely(chat, message, general):
     global next_send
     key = chat_key(chat)
-    loop = asyncio.get_running_loop()
     async with send_lock:
-        if key in blocked or slow_until.get(key, 0) > loop.time():
-            return
-        delay = next_send - loop.time()
-        if delay > 0:
-            await asyncio.sleep(delay)
-        wait = SEND_GAP
+        while True:
+            if key in blocked:
+                return "skip","القائمة السوداء"
+            if general and not database.execute("SELECT 1 FROM targets WHERE account=? AND k=?", (account,key)).fetchone():
+                return "skip","حُذفت المجموعة"
+            if slow_until.get(key,0)>time.time():
+                return "skip","الوضع البطيء"
+            if state.get("paused"):
+                await state.wait()
+                continue
+            delay = max(next_send,state.get("flood",0))-time.time()
+            if delay<=0:
+                break
+            await state.wait(delay)
         try:
-            await send_to_chat(chat, promo_message)
-            logging.info("Sent to %s from %s.", chat, source)
-        except (NotInGroup, errors.UserNotParticipantError):
+            await send_to_chat(chat,message)
+            logging.info("Sent to %s",chat)
+            return "ok",""
+        except (NotInGroup,errors.UserNotParticipantError):
             with database:
-                database.execute("INSERT OR IGNORE INTO blacklist VALUES (?, ?)", (account, key))
+                database.execute("INSERT OR IGNORE INTO blacklist VALUES (?,?)",(account,key))
             blocked.add(key)
-            logging.warning("Not a member of %s. Added to blacklist.", chat)
-        except errors.SlowModeWaitError as error:
-            slow_until[key] = loop.time() + error.seconds + 2
-            logging.info("Skipping %s for slow mode (%s seconds).", chat, error.seconds)
-        except errors.FloodWaitError as error:
-            wait = max(wait, error.seconds + 2)
-            logging.warning("Telegram requires a shared sending pause of %s seconds.", wait)
-        except (errors.ChatWriteForbiddenError, errors.UserBannedInChannelError):
-            logging.warning("Skipping %s because writing is restricted.", chat)
-        except Exception:
-            logging.exception("Skipping unavailable target %s.", chat)
+            return "skip","الحساب خارج المجموعة"
+        except errors.SlowModeWaitError as exc:
+            slow_until[key] = time.time()+exc.seconds+2
+            return "skip",f"الوضع البطيء · {exc.seconds} ثانية"
+        except errors.FloodWaitError as exc:
+            with database:
+                state.set("flood",time.time()+exc.seconds+2)
+            return "fail",f"انتظار عام فرضه تيليجرام · {exc.seconds} ثانية"
+        except (errors.ChatWriteForbiddenError,errors.UserBannedInChannelError):
+            return "skip","الإرسال مقيّد"
+        except Exception as exc:
+            logging.exception("Skipping %s",chat)
+            return "fail",type(exc).__name__
         finally:
-            next_send = loop.time() + wait
+            next_send = time.time()+SEND_GAP
 
 
-async def send_general_round():
-    promo_message = await get_latest_saved_message()
-
-    for chat in GENERAL_TARGET_CHATS:
-        await send_safely(chat, promo_message, "Saved Messages")
-
-
-async def send_second_special_round():
-    if chat_key(SECOND_SPECIAL_TARGET) in blocked:
-        return
-    promo_message = await get_latest_second_special_message()
-    await send_safely(
-        SECOND_SPECIAL_TARGET,
-        promo_message,
-        f"@{SECOND_SPECIAL_SOURCE}",
-    )
-
-
-async def run_general_promos():
+async def worker(kind):
+    general = kind=="general"
+    active, due = "active_"+kind, "due_"+kind
     while True:
+        r = state.get(active)
+        if state.get("paused"):
+            await state.wait()
+            continue
+        delay = max(state.get("flood",0), 0 if r else state.get(due,0))-time.time()
+        if delay>0:
+            await state.wait(delay)
+            continue
+        if not r:
+            targets = [k for _,k,_ in state.groups()] if general else [SECOND_SPECIAL_TARGET]
+            r = dict(targets=targets,index=0,ok=0,skip=0,fail=0,issues=[],message_id=None)
+            with database:
+                state.set(active,r)
         try:
-            await send_general_round()
-        except Exception:
-            logging.exception("General broadcast round failed.")
-
-        logging.info(
-            "Next general round in %s minutes.",
-            GENERAL_INTERVAL_SECONDS / 60,
-        )
-        await asyncio.sleep(GENERAL_INTERVAL_SECONDS)
-
-
-async def run_second_special_promo():
-    while True:
-        try:
-            await send_second_special_round()
-        except Exception:
-            logging.exception("Second special broadcast round failed.")
-
-        logging.info(
-            "Next second special round in %s minutes.",
-            SECOND_SPECIAL_INTERVAL_SECONDS / 60,
-        )
-        await asyncio.sleep(SECOND_SPECIAL_INTERVAL_SECONDS)
+            if r["index"]<len(r["targets"]):
+                if not general and chat_key(SECOND_SPECIAL_TARGET) in blocked:
+                    r.update(index=1,skip=1,issues=["المجموعة الخاصة · القائمة السوداء"])
+                else:
+                    if r["message_id"] is None:
+                        msg = await (get_latest_saved_message() if general else get_latest_second_special_message())
+                        r["message_id"] = msg.id
+                        with database:
+                            state.set(active,r)
+                    else:
+                        src = "me" if general else await resolve_chat(SECOND_SPECIAL_SOURCE)
+                        msg = await telegram_call(lambda:client.get_messages(src,ids=r["message_id"]))
+                        if not msg:
+                            raise ValueError("Source message unavailable")
+                    while r["index"]<len(r["targets"]):
+                        k = r["targets"][r["index"]]
+                        outcome,reason = await send_safely(k,msg,general)
+                        r[outcome]+=1
+                        r["index"]+=1
+                        if reason:
+                            r["issues"].append(f"{k} · {reason}")
+                        with database:
+                            state.set(active,r)
+        except errors.FloodWaitError as exc:
+            with database:
+                state.set("flood",time.time()+exc.seconds+2)
+            continue
+        except Exception as exc:
+            logging.exception("Promo source failed")
+            r["fail"]+=len(r["targets"])-r["index"]
+            r["index"]=len(r["targets"])
+            r["issues"].append("تعذّرت قراءة رسالة المصدر · "+type(exc).__name__)
+        interval = state.get("interval") if general else SECOND_SPECIAL_INTERVAL_SECONDS
+        with database:
+            state.set(active,None)
+            state.set("last_"+kind,r)
+            state.set(due,time.time()+interval)
+        if panel:
+            name = "العامة" if general else "الخاصة"
+            try:
+                await panel.api("sendMessage",chat_id=panel.admin,text=(
+                    f"اكتملت الجولة {name}\nنجح {r['ok']} · فشل {r['fail']} · تم تخطي {r['skip']}"))
+            except Exception as exc:
+                logging.warning("Round notification failed (%s)",type(exc).__name__)
 
 
 async def main():
-    global database, blocked, account
+    global database, blocked, account, state, panel
     await reconnect()
-
-    me = await telegram_call(client.get_me)
-    account = me.id
-    data_dir = Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or ".")
-    database = sqlite3.connect(data_dir / "promo_blacklist.sqlite3")
-    database.execute("CREATE TABLE IF NOT EXISTS blacklist (account INTEGER, target TEXT, PRIMARY KEY(account, target))")
-    blocked = {row[0] for row in database.execute("SELECT target FROM blacklist WHERE account=?", (account,))}
-    logging.info("Logged in as %s, %d blacklisted targets.", me.first_name, len(blocked))
-    logging.info(
-        "General promo: %s chats every %s minutes.",
-        len(GENERAL_TARGET_CHATS),
-        GENERAL_INTERVAL_SECONDS / 60,
-    )
-    logging.info(
-        "Second special promo: @%s receives @%s every %s minutes.",
-        SECOND_SPECIAL_TARGET,
-        SECOND_SPECIAL_SOURCE,
-        SECOND_SPECIAL_INTERVAL_SECONDS / 60,
-    )
-
-    await asyncio.gather(
-        run_general_promos(),
-        run_second_special_promo(),
-    )
+    account = (await telegram_call(client.get_me)).id
+    root = Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or ".")
+    database = sqlite3.connect(root / "promo_blacklist.sqlite3")
+    database.execute("CREATE TABLE IF NOT EXISTS blacklist (account INTEGER, target TEXT, PRIMARY KEY(account,target))")
+    blocked = {r[0] for r in database.execute("SELECT target FROM blacklist WHERE account=?",(account,))}
+    state = State(database,account,[chat_key(k) for k in GENERAL_TARGET_CHATS],GENERAL_INTERVAL_SECONDS)
+    token, admin = os.getenv("TG_BOT_TOKEN"),os.getenv("TG_ADMIN_ID")
+    if bool(token)!=bool(admin):
+        raise RuntimeError("Set both TG_BOT_TOKEN and TG_ADMIN_ID")
+    jobs = []
+    if token:
+        panel = Panel(token,int(admin),state,validate_groups,blocked)
+        jobs.append(panel.run())
+    await asyncio.gather(worker("general"),worker("special"),*jobs)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(main())
