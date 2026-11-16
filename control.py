@@ -68,7 +68,10 @@ class Panel:
     def __init__(self, token, admin, state, validate, blocked):
         self.url = "https://api.telegram.org/bot" + token + "/"
         self.admin, self.s, self.validate, self.blocked = admin, state, validate, blocked
-        self.pending = self.input = self.mid = None
+        self.pending = self.input = None
+        self.scope = f"panel:{admin}:{token.partition(':')[0]}"
+        self.mid = state.get(self.scope)
+        self.cleanup_key = self.scope + ":cleanup"
         self.plain = False
 
     async def api(self, method, **data):
@@ -93,6 +96,8 @@ class Panel:
                     await self.api("editMessageText", message_id=self.mid, **data)
                 else:
                     self.mid = (await self.api("sendMessage", **data))["message_id"]
+                    with self.s.db:
+                        self.s.set(self.scope, self.mid)
                 return
             except RuntimeError as exc:
                 msg = str(exc).lower()
@@ -238,6 +243,34 @@ class Panel:
         else:
             await self.show("لم تُحدَّد مجموعات جديدة للإضافة.\n"+body,[[BACK]])
 
+    def expire(self, message_id, seconds=0):
+        with self.s.db:
+            queue = self.s.get(self.cleanup_key, {})
+            queue[str(message_id)] = time.time() + seconds
+            self.s.set(self.cleanup_key, queue)
+
+    async def cleanup(self):
+        while True:
+            for key, due in self.s.get(self.cleanup_key, {}).items():
+                if due > time.time():
+                    continue
+                try:
+                    await self.api("deleteMessage", chat_id=self.admin, message_id=int(key))
+                except Exception as exc:
+                    detail = str(exc).lower()
+                    if not any(reason in detail for reason in ("message to delete not found", "message can't be deleted")):
+                        self.expire(int(key), 60)
+                        continue
+                with self.s.db:
+                    queue = self.s.get(self.cleanup_key, {})
+                    queue.pop(key, None)
+                    self.s.set(self.cleanup_key, queue)
+            await asyncio.sleep(1)
+
+    async def round_notice(self, text):
+        sent = await self.api("sendMessage", chat_id=self.admin, text=text)
+        self.expire(sent["message_id"], 60)
+
     async def run(self):
         offset = None
         while True:
@@ -256,7 +289,10 @@ class Panel:
                         if m["message_id"]==self.mid:
                             await self.screen(q["data"])
                     elif m.get("text") and m.get("from",{}).get("id")==self.admin:
+                        if not self.input and not m["text"].startswith("/"):
+                            self.input = "add"
                         await self.message(m["text"])
+                        self.expire(m["message_id"])
             except Exception as exc:
                 logging.warning("Admin panel unavailable (%s)",type(exc).__name__)
                 await asyncio.sleep(4)

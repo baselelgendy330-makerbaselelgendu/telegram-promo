@@ -408,8 +408,8 @@ async def worker(kind):
         if panel:
             name = "العامة" if general else "الخاصة"
             try:
-                await panel.api("sendMessage",chat_id=panel.admin,text=(
-                    f"اكتملت الجولة {name}\nنجح {r['ok']} · فشل {r['fail']} · تم تخطي {r['skip']}"))
+                await panel.round_notice(
+                    f"اكتملت الجولة {name}\nنجح {r['ok']} · فشل {r['fail']} · تم تخطي {r['skip']}")
             except Exception as exc:
                 logging.warning("Round notification failed (%s)",type(exc).__name__)
 
@@ -429,7 +429,7 @@ async def main():
     jobs = []
     if token:
         panel = Panel(token,int(admin),state,validate_groups,blocked)
-        jobs.append(panel.run())
+        jobs.extend((panel.run(), panel.cleanup()))
     await asyncio.gather(worker("general"),worker("special"),*jobs)
 
 
